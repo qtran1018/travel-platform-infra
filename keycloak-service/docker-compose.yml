@@ -1,0 +1,41 @@
+services:
+  keycloak-db:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+      
+    volumes:
+      - keycloak_pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    networks:
+      - travelplatform-network
+  
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://keycloak-db:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      JAVA_OPTS_APPEND: "-Xms128m -Xmx384m"
+    ports:
+      - "8180:8080"
+    volumes:
+      - ./themes:/opt/keycloak/themes
+    depends_on:
+      - keycloak-db
+    restart: unless-stopped
+    networks:
+      - travelplatform-network
+
+volumes: 
+  keycloak_pgdata:
+
+networks:
+  travelplatform-network:
+    external: true
