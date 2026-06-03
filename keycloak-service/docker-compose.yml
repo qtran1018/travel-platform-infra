@@ -25,7 +25,8 @@ services:
       JAVA_OPTS_APPEND: "-Xms128m -Xmx384m"
       KC_HOSTNAME: auth.quangntran.com
       KC_HOSTNAME_STRICT: "true"
-      KC_PROXY: edge
+      KC_PROXY_HEADERS: xforwarded
+      KC_HTTP_ENABLED: "true"
     ports:
       - "8180:8080"
     volumes:
