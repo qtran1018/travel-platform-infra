@@ -23,8 +23,8 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
       JAVA_OPTS_APPEND: "-Xms128m -Xmx384m"
-      KC_HOSTNAME: auth.quangntran.com
-      KC_HOSTNAME_STRICT: "true"
+      KC_HOSTNAME: https://auth.quangntran.com
+      KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: xforwarded
       KC_HTTP_ENABLED: "true"
     ports:
