@@ -23,6 +23,9 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
       JAVA_OPTS_APPEND: "-Xms128m -Xmx384m"
+      KC_HOSTNAME: auth.quangntran.com
+      KC_HOSTNAME_STRICT: "true"
+      KC_PROXY: edge
     ports:
       - "8180:8080"
     volumes:
