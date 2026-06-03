@@ -15,15 +15,16 @@
 
 ## Subdomain Plan
 
-| Subdomain                   | App                      |
-| --------------------------- | ------------------------ |
-| quangntran.com              | Portfolio landing page   |
-| auth.quangntran.com         | Keycloak SSO             |
-| app.quangntran.com          | Splitpush                |
-| travel.quangntran.com       | TravelBin frontend       |
-| api.quangntran.com          | TravelBin API            |
-| agent.quangntran.com        | Itinerary-Agent frontend |
-| intonational.quangntran.com | intonational aggregator  |
+| Subdomain                       | App                              |
+| ------------------------------- | -------------------------------- |
+| quangntran.com                  | Portfolio landing page           |
+| auth.quangntran.com             | Keycloak SSO                     |
+| splitpush.quangntran.com        | Splitpush                        |
+| travelbin.quangntran.com        | TravelBin frontend               |
+| travelbin-api.quangntran.com    | TravelBin API                    |
+| agent.quangntran.com            | Itinerary-Agent frontend         |
+| intonational.quangntran.com     | intonational frontend (future)   |
+| intonational-api.quangntran.com | intonational aggregator API      |
 
 ---
 
