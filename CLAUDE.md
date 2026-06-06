@@ -171,15 +171,21 @@ All Prisma routes wrapped in `try/catch` with `next(err)`; global 4-arg Express 
 - q16 prompt function returns `""` for blank input; `filter(Boolean)` at the end of `mapAnswersToPrompts` drops it.
 - `submitCheckbox` now calls `sendPrompt()` in its terminal branch (was missing — would have silently skipped the API call if the last question were ever a checkbox type).
 
-**Docker env vars required (combined mode):**
+**API URL abstraction:** `Quiz.vue` and `Profile.vue` use `const API_URL = import.meta.env.VITE_API_URL ?? ''`. An empty string produces relative `/api/...` paths proxied by Vite's dev server (`vite.config.ts` `server.proxy`). A non-empty `VITE_API_URL` (e.g. `https://agent-api.quangntran.com`) produces absolute URLs for production static builds. The proxy target is hardcoded to `'http://localhost:5000'` in `vite.config.ts` — `process.env` is unavailable in Vite configs without `@types/node`, and the proxy is dev-only anyway.
+
+**Docker — static build + override file:**
+
+`itinerary-agent/Dockerfile` is a multi-stage build: `node:20-alpine` compiles with `ARG VITE_API_URL` / `ARG VITE_KEYCLOAK_URL`; `nginx:alpine` serves `dist/` on port 3000. The nginx config includes an `/api/` proxy block (`proxy_pass http://itinerary-agent-backend:5000`) — critical because the backend has no public subdomain; the static build loses the Vite proxy and the nginx must replicate it.
+
+- `docker-compose.yml` — **production**: backend `ports: "127.0.0.1:5000:5000"` (localhost-only, not publicly exposed); frontend build args `VITE_API_URL: https://agent-api.quangntran.com`, `VITE_KEYCLOAK_URL: https://auth.quangntran.com`.
+- `docker-compose.override.yml` — **local dev**: backend `KEYCLOAK_ISSUER: http://localhost:8180/...`; frontend build args `VITE_API_URL: http://localhost:5000`, `VITE_KEYCLOAK_URL: http://localhost:8180`. Auto-applied by plain `docker compose` (no `-f`).
+
+**Docker env vars required (backend, combined mode):**
 ```yaml
-# itinerary-agent-backend service in docker-compose.yml
 KEYCLOAK_ISSUER: http://localhost:8180/realms/travel-platform   # validates token iss
 KEYCLOAK_JWKS_URL: http://keycloak:8080/realms/travel-platform/protocol/openid-connect/certs  # fetches keys via internal network
 TRAVELBIN_API_URL: http://travelbin-backend:8000   # internal network hostname
-VITE_BACKEND_URL: http://itinerary-agent-backend:5000  # frontend service, proxies /api
 ```
-All four must be set in combined Docker mode; .env defaults to localhost which is unreachable from inside containers.
 
 **Frontend routing:** Vue Router 4 with hash history. `/` → Quiz (Planner), `/profile` → Profile (saved trips). On `check-sso` callback, App.vue cleans any leftover OAuth params from the URL so the Planner route renders correctly when not authenticated.
 
@@ -266,14 +272,23 @@ ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
 - `AuthContext.jsx` — `keycloak.init({ onLoad: 'check-sso' })`, exposes `user` and `authLoading`. Components wait on `authLoading` to prevent flash of unauthenticated UI
 - `api.js` — Axios interceptor calls `keycloak.updateToken(30)` before each request
 - Navbar "Log In" calls `keycloak.login()` directly; `/login` and `/register` routes redirect immediately to Keycloak
+- `AuthContext.jsx` `logout()` uses `redirectUri: window.location.href` — user stays on the current page after logout (not redirected to home)
+- `Home.jsx` guards on `authLoading` before rendering (`if (authLoading) return null`) — prevents the logged-out home flash during the Keycloak SSO check on login
 
 ### Exception handling
 
 `Traveler/exceptions.py` — custom DRF exception handler logs unhandled errors and returns `{"error": "..."}`. Settings registers it via `REST_FRAMEWORK['EXCEPTION_HANDLER']`. Django `LOGGING` config in `settings.py` routes the `Traveler` logger to console (replaces `print()` calls in views). 15+ test cases in `Traveler/tests.py` cover auth, 404s, permission denials, import.
 
-### Docker volume gotcha
+### Docker — static build + override file
 
-The `travelbin-frontend` service does **not** use a bind-mount volume for source (`./travelbin-frontend:/app`) plus an anonymous `node_modules` volume. That pattern caches `node_modules` across rebuilds, so adding a new npm dependency (like `keycloak-js`) doesn't take effect even with `--no-cache`. The current docker-compose just runs the image as-is. After changing `package.json`, run `docker compose build travelbin-frontend && docker compose up -d travelbin-frontend`.
+`travelbin-frontend/Dockerfile` is a multi-stage build: `node:20-alpine` compiles the Vite app with `ARG VITE_API_URL` / `ARG VITE_KEYCLOAK_URL`; the resulting `dist/` is served by `nginx:alpine` on port 3001. The nginx config includes `try_files $uri $uri/ /index.html` (SPA fallback — harmless with HashRouter but present for robustness).
+
+**Build arg discipline:** `VITE_API_URL` and `VITE_KEYCLOAK_URL` are baked at build time.
+- `docker-compose.yml` — **production** values (`https://travelbin-api.quangntran.com`, `https://auth.quangntran.com`) under `build.args`. Ports `3001:3001`.
+- `docker-compose.override.yml` — **local dev** values (`http://localhost:8000`, `http://localhost:8180`) + backend `KEYCLOAK_ISSUER` / `CORS_ALLOWED_ORIGINS` overrides. Auto-applied by plain `docker compose` (no `-f`).
+- Running `docker compose -f docker-compose.yml up` explicitly skips the override (production build). Never use `-f` for local dev.
+
+After changing `package.json`, rebuild: `docker compose build travelbin-frontend && docker compose up -d travelbin-frontend`.
 
 ### Invite links
 
@@ -292,17 +307,27 @@ The `travelbin-frontend` service does **not** use a bind-mount volume for source
 
 - `POST /travel/destinations/import/` — creates destination + pre-populates `TravelEntry` from structured entries array
 
-### Destination name editing
+### Destination name editing and creation
 
 - Destination `name` is a plain `CharField(max_length=100)` — no `unique` constraint, no FK references (all relationships use UUID `id`). Safe to rename without breaking anything.
 - `DestinationShow.jsx`: ✏️ pencil button appears per row when `canCreate=true` (owner). Click → inline `<input>` pre-filled with current name, max 100 chars. Enter/✓ saves via `PATCH /travel/d/<id>/update/`; Escape/✕ cancels. All members see the updated name (one shared name per destination — per-user independent labels would require a new model field).
+- New-destination input is an inline form in the header (`newName`/`setNewName` state, `onSubmit={handleCreate}`). No search popup — the input doubles as the create field. The `+ New` button is `type="submit"` so Enter also submits.
 
-### Entry table — editable cells
+### Entry table — day groups, drag-and-drop, editable cells
 
-- Name, Location, and Notes cells use `<textarea rows="1">` with JS auto-resize (`onInput` + `useEffect` on data change). Textareas grow to fit content identically to the read-only `<td>` plain-text view. No fixed min-height.
+Entries are grouped into per-day sections using a `groupByDate()` helper that returns `[[dateKey, items[]], ...]` sorted chronologically, with an "Unscheduled" group (null date) always last. Each group renders as a `<section class="day-group">` with a header showing the formatted date and entry count, then a table of entries.
+
+**Drag-and-drop reordering** uses `@atlaskit/pragmatic-drag-and-drop` v1.5.2 (`draggable`, `dropTargetForElements`, `monitorForElements` from `element/adapter`). Each row has a drag handle column (hidden on mobile). Drop updates local state immediately (optimistic), then calls `POST /travel/d/<id>/reorder/` with the target group's new sort order.
+
+**Cross-group drag:** dropping an entry onto a row in a different day group assigns that group's date to the entry (null for Unscheduled). The `monitorForElements` handler detects `sourceDateKey !== targetDateKey`, PATCHes the entry's date, and posts the target group's new sort order. `canDrop` only excludes self-drop (no same-group restriction).
+
+**`sort_order`** (`IntegerField(default=0)`) persists the within-day order. Backend query orders by `sort_date` then `sort_order`. Batch reorder uses `bulk_update` in an atomic transaction.
+
+- Name, Location, and Notes cells use `<textarea rows="1">` with JS auto-resize. Textareas grow to fit content; no fixed min-height.
 - Type uses `<select>`, Date uses `<input type="date">` — unchanged.
 - Auto-save fires 600 ms after the last keystroke (debounced). Saving/Saved/Error indicator shown per-row.
-- Entry page heading shows the actual destination name fetched from `GET /travel/d/<pk>/detail/` (public endpoint, no auth required) instead of the hardcoded "Travel Entries".
+- New-entry row sits above all day groups in its own table (always Unscheduled until a date is entered).
+- Entry page heading shows the actual destination name from `GET /travel/d/<pk>/detail/` (public, no auth).
 
 ### Backend endpoints
 
@@ -315,7 +340,8 @@ The `travelbin-frontend` service does **not** use a bind-mount volume for source
 | DELETE | `/travel/d/<pk>/delete/` | ✓ perms | Delete destination |
 | GET | `/travel/d/<destination_id>/` | — | List entries for a destination |
 | POST | `/travel/d/<pk>/create_entry/` | ✓ | Add entry |
-| PATCH | `/travel/<pk>/update/` | ✓ | Update entry (auto-save) |
+| POST | `/travel/d/<destination_id>/reorder/` | ✓ perms | Batch-reorder entries (DnD) |
+| PATCH | `/travel/<pk>/update/` | ✓ | Update entry (auto-save, supports `date` + `sort_order`) |
 | DELETE | `/travel/<pk>/delete/` | ✓ | Delete entry |
 | GET | `/travel/me/` | ✓ | Current user info |
 | POST | `/travel/destinations/import/` | ✓ | Import from Itinerary-Agent |
@@ -484,6 +510,22 @@ When you have a domain:
 | `TRAVELBIN_API_URL` (Itinerary-Agent) | `http://localhost:8000` | `https://api.yourdomain.com` |
 
 Recommended VPS architecture: nginx (or Nginx Proxy Manager) terminates TLS, subdomains route to each app's port, all containers share `travelplatform-network`. ~4GB RAM is enough with the JVM heap caps and shared Postgres.
+
+### Production build status (as of June 2026 — live on OCI)
+
+The platform is deployed. Full state, rationale, and the per-app migration plan (with landmines) live in **`DEPLOYMENT.md` → "Production Hardening — Path to Real Production"**. Summary:
+
+| Service | Runtime | Prod-correct? |
+|---|---|---|
+| TravelBin backend | gunicorn | ✅ |
+| Splitpush | built JAR | ✅ |
+| Itinerary-Agent backend | `node dist/server.js` | ✅ |
+| TravelBin frontend | static nginx (`nginx:alpine`) | ✅ |
+| Itinerary-Agent frontend | static nginx + `/api` proxy | ✅ |
+| Keycloak | `start-dev` + `KC_HOSTNAME` | ⚠️ works, dev mode |
+| intonational | empty Dockerfiles | ⏸️ not deployed |
+
+Keycloak `start-dev`→`start` is a separate higher-risk pass and is the only remaining production hardening item.
 
 ---
 

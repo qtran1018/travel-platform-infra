@@ -276,6 +276,41 @@ Default config bans IPs after 5 failed SSH attempts. No further config needed fo
 ### OCI Security List reminder
 Only ports 22, 80, 443 should be open. All app ports (8080, 8000, 3001, etc.) are internal only — nginx proxies them and they are never exposed directly.
 
+### Shared Postgres — remove host exposure + rotate credentials (Phase 0, do first)
+
+The shared `platform-postgres` (holding **all three** app databases) currently publishes `5432:5432` to the host and ships with default/dictionary credentials at every level (`postgres/postgres`, `travelbin/travelbin`, `splitpush_user/splitpush_pass`, `itinerary_user/itinerary_pass`). The published port means the OCI Security List is the *only* layer between the internet and the database — no defense-in-depth. Two independently-shippable parts:
+
+**0a. Remove host port exposure — near-zero risk.**
+- `postgres-service/docker-compose.yml`: delete the `ports: - "5432:5432"` block. Apps reach the DB via `platform-postgres:5432` on `travelplatform-network` — unaffected.
+- `postgres-service/docker-compose.override.yml` (new): re-add `ports: - "127.0.0.1:5432:5432"` for local dev tools, bound to localhost only.
+- Verify: `docker compose -f docker-compose.yml config` shows no published port; local `docker compose config` shows `127.0.0.1:5432`.
+- ⚠️ Removing a port mapping forces a container **recreate** → brief DB blip while apps reconnect. Do it in a low-traffic window; apps auto-reconnect via `restart: unless-stopped`.
+
+**0b. Rotate credentials — data-sensitive, separate step.**
+- ⚠️ **Landmine:** `POSTGRES_PASSWORD` and init scripts only apply on **first init of an empty volume**. The live DB already has data, so editing compose/init changes nothing on the running DB. Rotation must be done with SQL against the live DB, coordinated with updating each app's env.
+- Credentials are now env-driven in all compose files (`${VAR:-devdefault}`). Production must set strong values in `postgres-service/.env.secrets` (not committed — see `.env.example`). Generate passwords with `openssl rand -base64 32`.
+- **Rotation procedure (run once on the prod server):**
+
+```bash
+# 1. Rotate each role in the running DB
+docker exec platform-postgres psql -U postgres -c "ALTER ROLE postgres WITH PASSWORD 'NEW_SUPERUSER_PASS';"
+docker exec platform-postgres psql -U postgres -c "ALTER ROLE travelbin WITH PASSWORD 'NEW_TRAVELBIN_PASS';"
+docker exec platform-postgres psql -U postgres -c "ALTER ROLE splitpush_user WITH PASSWORD 'NEW_SPLITPUSH_PASS';"
+docker exec platform-postgres psql -U postgres -c "ALTER ROLE itinerary_user WITH PASSWORD 'NEW_ITINERARY_PASS';"
+
+# 2. Create postgres-service/.env.secrets with the same values
+# (this file is gitignored — never commit it)
+
+# 3. Restart services one at a time, verifying each reconnects before the next
+docker compose -f docker-compose.yml up -d  # postgres-service — picks up new superuser pw
+# Then from each app directory:
+docker compose -f docker-compose.yml up -d travelbin-backend
+docker compose -f docker-compose.yml up -d splitpush-app
+docker compose -f docker-compose.yml up -d itinerary-agent-backend
+```
+
+- `init.sql` has been replaced by `init.sh` which reads the same env vars — fresh installs automatically use strong credentials if the secrets file is present.
+
 ---
 
 ## Making Code Changes
@@ -288,11 +323,13 @@ edit locally → git push → SSH into server → git pull → rebuild container
 
 ### Rebuild a specific service
 
+> **⚠️ Deploy discipline:** override files (`docker-compose.override.yml`) now exist for `postgres-service`, `keycloak-service`, `TravelBin`, and `Itinerary-Agent`, holding **local-dev** values (localhost URLs, exposed DB port, Keycloak `start-dev`). `docker compose` auto-merges them. **Production must always pin `-f docker-compose.yml`** to exclude them — a bare `docker compose up` on the server would silently flip every service to localhost and break prod.
+
 ```bash
 cd travel-platform
 git pull
-docker compose build --no-cache <service-name>
-docker compose up -d <service-name>
+docker compose -f docker-compose.yml build --no-cache <service-name>
+docker compose -f docker-compose.yml up -d <service-name>
 ```
 
 ### Service names
@@ -316,8 +353,8 @@ docker compose up -d <service-name>
 - [x] Docker installed on server
 - [x] Repos cloned on server (one repo per app + `travel-platform-infra`)
 - [x] All `.env` files filled with production values
-- [ ] Keycloak admin password changed from default (still `admin`/`admin` — DO THIS)
-- [ ] PostgreSQL credentials changed from defaults in `init.sql`
+- [x] Keycloak admin password changed from default (production no longer uses `admin`/`admin`; CLAUDE.md still documents the dev default)
+- [ ] PostgreSQL credentials changed from defaults in `init.sql` (still default in prod — DO THIS)
 - [x] Django `SECRET_KEY` env-based (override `DJANGO_SECRET_KEY` for a strong value)
 - [x] `DEBUG=False` in TravelBin Django settings
 - [x] OpenAI API key set for Itinerary-Agent
@@ -348,13 +385,73 @@ docker compose up -d <service-name>
 
 ### Still outstanding (post-launch hardening)
 
-- [ ] Change Keycloak admin password from `admin`/`admin`
-- [ ] Change Postgres credentials in `init.sql`
-- [ ] Switch both Vite frontends from dev server to production build (`vite build` + static serve) — removes HMR WebSocket console noise and is the correct prod setup
+- [x] Change Keycloak admin password from `admin`/`admin` (done — production admin is no longer the default)
+- [ ] Change Postgres credentials in `init.sql` (still default in production — outstanding)
+- [ ] Switch both Vite frontends + the Itinerary-Agent backend from dev servers to production builds — see **[Production Hardening — Path to "Real" Production](#production-hardening--path-to-real-production)** for the full per-app plan, rationale, and landmines
+- [ ] Migrate Keycloak `start-dev` → production `start` (separate higher-risk pass — see same section)
 - [ ] intonational Python services still have empty placeholder Dockerfiles — only Mongo + Redis run
 - [ ] Migrate intonational MongoDB → shared Postgres (drop a container)
 - [ ] nginx rate limiting + apply security hardening section
 - [ ] Decommission Splitpush on Render once OCI is trusted
+
+---
+
+## Production Hardening — Path to "Real" Production (planned, not yet done)
+
+The platform is **live and functional**, but three services still run **development servers** behind nginx rather than production builds. This section documents the current state, why moving to production builds matters, and the exact per-app migration — so it can be executed later as a deliberate pass.
+
+### Current runtime state (June 2026)
+
+| Service | Runs as | Production-correct? |
+|---|---|---|
+| TravelBin backend | `gunicorn` (2 workers) | ✅ Yes |
+| Splitpush | multi-stage built JAR (`java -jar`) | ✅ Yes |
+| Keycloak | `start-dev` + `KC_HOSTNAME` hacks | ⚠️ Works, but dev mode (see below) |
+| **TravelBin frontend** | **Vite dev server** (`npm run dev`) | ❌ No |
+| **Itinerary-Agent frontend** | **Vite dev server** (`npm run dev --host`) | ❌ No |
+| **Itinerary-Agent backend** | `node dist/server.js` (built JS) | ✅ Yes — migrated June 2026 |
+| intonational | empty Dockerfiles — only Mongo + Redis run | ⏸️ Not deployed (out of scope) |
+
+The visible symptom of the dev frontends: a console error `Firefox can't establish a connection to wss://travelbin.quangntran.com/?token=…` — Vite's HMR websocket trying (and failing) to reach a hot-reload endpoint that nginx/Cloudflare don't proxy. Harmless functionally, but a tell that dev servers are public-facing.
+
+### Why move to production builds (rationale)
+
+This is a **public-facing portfolio**, which is exactly where it matters — other engineers may inspect the network tab and console.
+
+- **Security (primary):** Vite's dev server ships unminified source + source maps + the full module graph publicly; it is explicitly *not* hardened for internet exposure (HMR websocket, `/@fs/` filesystem endpoint have had CVEs). Both configs set `allowedHosts: true`, which disables the host-header check. `ts-node` keeps the TS compiler + dev tooling in the running container. Production = nginx serving static minified bundles + `node dist/server.js`, far smaller attack surface.
+- **Resource use:** Always-Free OCI has finite RAM. Dev servers hold the module graph in memory and recompile on the fly; nginx serving `dist/` uses a fraction of the RAM/CPU and serves pre-minified, pre-gzipped assets (faster page loads).
+- **Stability:** built artifacts are fixed and tested ("what you build is what runs"); dev servers can leak memory over long uptimes and assume a developer is watching.
+- **Correctness:** `vite build` / `tsc` run the full type-check + bundler, surfacing errors the lenient dev path tolerates.
+
+**Counterpoint (why it's not urgent):** functionally identical to a casual visitor; no new features; carries migration risk. If this were a 3-user internal tool, leaving it would be defensible.
+
+**Decision:** do it later, **incrementally, lowest-risk first** (backend → TravelBin frontend → Itinerary frontend). All changes are reversible (revert Dockerfile, rebuild → dev image returns).
+
+### Per-app migration plan + landmines
+
+**1. Itinerary-Agent backend (`ts-node` → built JS)** — ✅ Done June 2026
+- `RUN npm run build` at build time; `CMD ["node", "dist/server.js"]`. `tsc` was clean — no type errors surfaced.
+- ⚠️ **Session note:** after any auth-config change (e.g. switching Keycloak URL), browsers holding a stale token will get a 400. Users must log out and back in to get a fresh token. Expected — not a bug.
+
+**2. TravelBin frontend (Vite dev → static nginx)** — ✅ Done June 2026
+- Multi-stage Dockerfile: `node:20-alpine` runs `npm ci && npm run build` → `dist/`; `nginx:alpine` serves `dist/` on port 3001.
+- `VITE_API_URL` and `VITE_KEYCLOAK_URL` are baked as Docker `ARG`s at build time. Prod values in `docker-compose.yml` `build.args`; localhost defaults in `docker-compose.override.yml` (auto-applied by plain `docker compose`).
+- Uses `HashRouter` — `try_files` SPA fallback added to nginx config (harmless, not strictly needed).
+- API calls go to `travelbin-api.quangntran.com` (separate subdomain, proxied to `:8000`), so the frontend nginx needs **no** `/api` proxy.
+
+**3. Itinerary-Agent frontend (Vite dev → static nginx)** — ✅ Done June 2026
+- Multi-stage Dockerfile: `node:20-alpine` build → `nginx:alpine` serves `dist/` on port 3000.
+- **The `/api` proxy landmine resolved:** `Quiz.vue` and `Profile.vue` use `import.meta.env.VITE_API_URL ?? ''`. Setting `VITE_API_URL=https://agent-api.quangntran.com` at build time makes all fetch calls absolute — no nginx `/api` proxy needed in the static build. The nginx inside the container still has `location /api/ { proxy_pass http://itinerary-agent-backend:5000; }` as a fallback (unused in prod since calls are absolute).
+- `VITE_KEYCLOAK_URL` is also a build `ARG` (reads `import.meta.env.VITE_KEYCLOAK_URL` in `keycloak.ts`).
+- Uses hash routing — no SPA `try_files` needed.
+
+### Keycloak: dev mode → production `start` (separate, higher-risk follow-up)
+
+Keycloak still runs `start-dev` with `KC_HOSTNAME=https://auth.quangntran.com` + `KC_PROXY_HEADERS=xforwarded`. True production is `start` with `KC_HOSTNAME_STRICT=true`. Auth is the backbone of every app, so this is its **own deliberate migration**, not part of the frontend pass. Note: per the original plan, going to a single public issuer would let you delete the Splitpush `KeycloakClientConfig.java` workaround and TravelBin's `KEYCLOAK_JWKS_URL` split — **but** the deployment log shows both were intentionally *kept* because Cloudflare 403s the server→public JWKS fetch. Re-validate that constraint before removing either.
+
+### Middle-ground (if not doing the full migration)
+
+To silence just the HMR websocket console error without a build migration: set `hmr: false` in each `vite.config` `server` block and rebuild the frontend images. Removes the visible error but keeps all the source-exposure / resource downsides above.
 
 ---
 
