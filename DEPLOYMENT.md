@@ -331,13 +331,33 @@ docker compose -f docker-compose.yml up -d <service-name>
 
 ### Service names
 
-| App                      | Service name                |
-| ------------------------ | --------------------------- |
-| TravelBin backend        | `travelbin-backend`       |
-| TravelBin frontend       | `travelbin-frontend`      |
-| Splitpush                | `splitpush`               |
-| Itinerary-Agent backend  | `itinerary-agent-backend` |
-| Itinerary-Agent frontend | `itinerary-agent`         |
+> ⚠️ These are the **compose service names** (what you pass to `build`/`up`), which differ from the container names. Using the wrong name gives `no such service: ...` and silently skips the build (then `up -d` reuses the stale image).
+
+| App                      | Service name (`build`/`up`) | Container name             |
+| ------------------------ | --------------------------- | -------------------------- |
+| TravelBin backend        | `travelbin-backend`         | `travelbin-backend`        |
+| TravelBin frontend       | `travelbin-frontend`        | `travelbin-frontend`       |
+| Splitpush                | `app`                       | `splitpush-app`            |
+| Itinerary-Agent backend  | `itinerary-agent-backend`   | `itinerary-agent-backend`  |
+| Itinerary-Agent frontend | `itinerary-agent-frontend`  | `itinerary-agent-frontend` |
+
+---
+
+## Post-Deploy Database Migrations (REQUIRED after backend code changes)
+
+> **Rebuilding an image ships new code; it does NOT change the database schema.** Every schema-dependent feature (new columns, etc.) needs an explicit migration step *after* the rebuild, or the new code will 500 with `column ... does not exist`. This was the single biggest source of post-deploy breakage — make it a reflex.
+
+Run the matching command **after** `git pull` + rebuild + `up -d`:
+
+| App | Migration command | Notes |
+|---|---|---|
+| TravelBin | `docker exec travelbin-backend python manage.py migrate` | Django migrations (`Traveler/migrations/`). Verify with `showmigrations Traveler` — all `[X]`. |
+| Itinerary-Agent | `docker exec itinerary-agent-backend npx prisma db push` | ⚠️ Run **after** the backend image is rebuilt — `db push` reads the schema *inside the container*. Running it against a stale image is a no-op ("already in sync") and won't add new columns. |
+| Splitpush | (none) | Hibernate `ddl-auto=update` auto-applies on startup. |
+
+**Symptoms that you skipped this:** `500` on save/list/export; Django log `column "X" does not exist`; Prisma error `P2022 The column X does not exist in the current database`.
+
+> Order matters for Itinerary-Agent: **rebuild → `up -d` → `db push`**. The `db push` must see the new schema baked into the freshly-built image.
 
 ---
 
