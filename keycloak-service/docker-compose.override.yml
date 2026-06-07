@@ -1,0 +1,11 @@
+# LOCAL DEV ONLY — automatically applied by `docker compose up`.
+# Production deploy uses: docker compose -f docker-compose.yml up
+#
+# Clears KC_HOSTNAME so Keycloak start-dev uses the request URL as the issuer
+# (http://localhost:8180/realms/travel-platform) instead of the production domain.
+# Tokens signed locally can then be validated by the app backends.
+
+services:
+  keycloak:
+    environment:
+      KC_HOSTNAME: ""
