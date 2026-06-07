@@ -26,8 +26,8 @@ A portfolio of five independent travel apps plus shared infrastructure (Keycloak
 **Path:** `postgres-service/`
 **Purpose:** Shared PostgreSQL 16 instance hosting all three app databases (splitpush, travelbin, itinerary_agent). Replaces the per-app PG containers when running in "combined" mode — saves ~300MB RAM and simplifies backups.
 
-- `docker-compose.yml` — single PG container, port 5432, container name `platform-postgres`
-- `init.sql` — creates one DB per app with per-app credentials (each app only sees its own DB)
+- `docker-compose.yml` — single PG container, container name `platform-postgres`. Port 5432 is **not published in prod**; the local-dev override binds `127.0.0.1:5432:5432` for DB tools. Per-app DB passwords come from env vars (`SPLITPUSH_DB_PASSWORD`, `TRAVELBIN_DB_PASSWORD`, `ITINERARY_DB_PASSWORD`, `POSTGRES_SUPERUSER_PASSWORD`).
+- `init.sh` — creates one DB + user per app, reading the password env vars (replaces the old static `init.sql`). Each app only sees its own DB. Runs only on first init of an empty volume.
 
 Each app's docker-compose still has its own PG service marked `profiles: ["standalone"]`, so the original isolated mode is preserved. See [Running Locally](#running-locally-dev-setup) for the two modes.
 
@@ -38,9 +38,11 @@ Each app's docker-compose still has its own PG service marked `profiles: ["stand
 **Path:** `keycloak-service/`
 **Purpose:** Centralized SSO server. Docker Compose only — no app code.
 **Stack:** Keycloak 26.0 + PostgreSQL 16
-**Admin:** `http://localhost:8180` — credentials `admin` / `admin`
-**Port:** 8180 (host) → 8080 (container)
+**Admin:** `http://localhost:8180` — dev credentials `admin` / `admin`
+**Port:** 8180 (host) → 8080 (container). In the base (prod) compose the host side is bound to `127.0.0.1:8180:8080` — admin console reachable only via the nginx reverse proxy, never the public internet.
 **JVM heap cap:** `JAVA_OPTS_APPEND=-Xms128m -Xmx384m` (saves ~300MB vs default)
+
+**Credentials are env-driven** (no longer hardcoded in compose): `KEYCLOAK_DB_PASSWORD` (required, `:?`), `KEYCLOAK_ADMIN` (default `admin`), `KEYCLOAK_ADMIN_PASSWORD` (required, `:?`). Local dev supplies them via gitignored `keycloak-service/.env` (auto-loaded). ⚠️ On an existing deployment, `KEYCLOAK_DB_PASSWORD` must match the password already in the `keycloak_pgdata` volume (a mismatch takes down all SSO), and `KEYCLOAK_ADMIN_PASSWORD` only seeds the admin on first boot. See `DEPLOYMENT.md` for the rotation procedure.
 
 **Realm:** `travel-platform`
 
@@ -199,9 +201,11 @@ TRAVELBIN_API_URL: http://travelbin-backend:8000   # internal network hostname
 **Purpose:** Splitwise-style expense splitter. Users create groups, log expenses, settle balances.
 
 **Stack:** Spring Boot 3.2.0 (Java 17), Spring Security, Spring Data JPA, Thymeleaf, Caffeine cache, PostgreSQL
-**URL:** `http://localhost:8080`
+**URL:** `http://localhost:8080` (base/prod compose binds the host side to `127.0.0.1:8080:8080` — reachable only via nginx)
 **JVM heap cap:** `JAVA_TOOL_OPTIONS=-Xms128m -Xmx256m` (saves ~250MB)
 **Production:** Render + Supabase — see `RENDER_DEPLOYMENT.md`
+
+**`KEYCLOAK_CLIENT_SECRET` is required** — wired through `docker-compose.yml` as `${KEYCLOAK_CLIENT_SECRET:?}`; the confidential client no longer falls back to the committed `splitpush-secret`. Local dev supplies it via gitignored `Splitpush/.env` (auto-loaded); prod sets a strong value from Keycloak Admin → `splitpush` client → Credentials. `application-docker.properties` (the prod profile) logs Spring Security oauth2/web at **WARN**, not DEBUG.
 
 ### Auth — Keycloak OIDC
 
@@ -252,8 +256,10 @@ ALTER TABLE users ALTER COLUMN password DROP NOT NULL;
 **Purpose:** Collaborative travel planning. Users build and share trip itineraries.
 
 **Structure:**
-- `travelbin-backend/` — Django 5.1 REST API, port 8000
-- `travelbin-frontend/` — React 19 SPA, port **3001** (mapped 3001:3001 in Docker — Vite config is `host: '0.0.0.0', port: 3001`)
+- `travelbin-backend/` — Django 5.1 REST API, port 8000 (base/prod compose binds host side to `127.0.0.1:8000:8000` — reachable only via nginx)
+- `travelbin-frontend/` — React 19 SPA, port **3001** (mapped 3001:3001 in Docker — Vite config is `host: '0.0.0.0', port: 3001`; left on `0.0.0.0` for local LAN device testing)
+
+**`DJANGO_SECRET_KEY` is required** — compose passes `SECRET_KEY: ${DJANGO_SECRET_KEY:?}`; the insecure `django-insecure-…` fallback was removed from compose. Local dev supplies it via gitignored `TravelBin/.env` (auto-loaded); prod sets a strong value. (`settings.py` still keeps its own `os.getenv('SECRET_KEY', 'django-insecure-…')` fallback, but the compose `:?` guarantees the var is always set in docker prod, so the fallback is never reached there.)
 
 **Backend:** Django 5.1.7, DRF 3.15.2, PyJWT, psycopg v3, gunicorn
 **Frontend:** React 19, Vite 6, React Router v7, TanStack Query v5, Axios, keycloak-js
@@ -548,15 +554,19 @@ networks:
 
 ## Environment Variables (Summary)
 
+**Required secrets fail loud.** Compose files use `${VAR:?}` for the secrets below — the container won't start if unset. Provide them in a **gitignored `.env` file in the same directory as the compose file** (auto-loaded by `docker compose`, even with `-f docker-compose.yml`). Each directory has a `.env.example`. **🔑 = required (`:?`).**
+
 | App | Key Variables |
 |---|---|
-| postgres-service | (none — credentials in `init.sql`) |
-| keycloak-service | `KEYCLOAK_ADMIN`, `KEYCLOAK_ADMIN_PASSWORD`, `JAVA_OPTS_APPEND` |
+| postgres-service | 🔑 `POSTGRES_SUPERUSER_PASSWORD`, 🔑 `SPLITPUSH_DB_PASSWORD`, 🔑 `TRAVELBIN_DB_PASSWORD`, 🔑 `ITINERARY_DB_PASSWORD` (consumed by `init.sh`) |
+| keycloak-service | 🔑 `KEYCLOAK_DB_PASSWORD`, 🔑 `KEYCLOAK_ADMIN_PASSWORD`, `KEYCLOAK_ADMIN` (default `admin`), `JAVA_OPTS_APPEND` |
 | intonational | External API keys, Redis/Mongo URIs |
 | Itinerary-Agent backend | `OPENAI_API_KEY`, `DATABASE_URL` (overridden in compose), `KEYCLOAK_ISSUER` |
-| Splitpush | `POSTGRES_HOST` (combined mode), `SPRING_PROFILES_ACTIVE=docker`, `JAVA_TOOL_OPTIONS`, `KEYCLOAK_CLIENT_SECRET` |
-| TravelBin backend | `SECRET_KEY`, `DB_HOST` (from `POSTGRES_HOST`), `DB_PORT`, `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL` |
+| Splitpush | 🔑 `KEYCLOAK_CLIENT_SECRET`, `POSTGRES_HOST` (combined mode), `SPRING_PROFILES_ACTIVE=docker`, `JAVA_TOOL_OPTIONS` |
+| TravelBin backend | 🔑 `DJANGO_SECRET_KEY` (→ `SECRET_KEY`), `DB_HOST` (from `POSTGRES_HOST`), `DB_PORT`, `KEYCLOAK_ISSUER`, `KEYCLOAK_JWKS_URL` |
 | TravelBin frontend | `VITE_API_URL` |
+
+> `init.sql` was replaced by `init.sh` (reads the per-app password env vars). On an *existing* DB volume, password env vars only apply via SQL rotation, not a recreate — see `DEPLOYMENT.md`.
 
 ---
 

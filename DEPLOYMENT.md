@@ -124,55 +124,38 @@ All app ports (8080, 8000, 3001, etc.) stay internal — nginx proxies them.
 
 ## Environment Variables to Set
 
-### keycloak-service
+> **Required secrets now fail loud.** Several compose files use `${VAR:?...}` —
+> if the variable is unset the container **will not start** (`required variable
+> X is missing a value`). This is deliberate: it prevents production from
+> silently falling back to a repo-committed default secret. Provide each value
+> in a **gitignored `.env` file** placed in the *same directory as the compose
+> file*; `docker compose` auto-loads it for interpolation (even with `-f
+> docker-compose.yml`). Non-prod URLs/issuers stay in the `docker-compose.override.yml`
+> files. Generate strong values with `openssl rand -base64 32`.
 
-```env
-KEYCLOAK_ADMIN=admin
-KEYCLOAK_ADMIN_PASSWORD=<strong-password>
-KC_HOSTNAME=auth.quangntran.com
-KC_HOSTNAME_STRICT=true
-KC_PROXY=edge
-```
+### `.env` files required on the server (one per directory)
 
-### postgres-service
+| File | Required keys | Notes |
+|---|---|---|
+| `keycloak-service/.env` | `KEYCLOAK_DB_PASSWORD`, `KEYCLOAK_ADMIN_PASSWORD` (and optional `KEYCLOAK_ADMIN`) | ⚠️ `KEYCLOAK_DB_PASSWORD` must **match the password already in the existing `keycloak_pgdata` volume** (originally `keycloak`) or Keycloak can't reach its DB and **all SSO goes down**. To actually rotate: `ALTER USER keycloak PASSWORD '<new>'` in `keycloak-db`, *then* update `.env`. `KEYCLOAK_ADMIN_PASSWORD` only seeds the admin on first boot — rotate an existing admin via the console/kcadm. |
+| `postgres-service/.env` | `POSTGRES_SUPERUSER_PASSWORD`, `SPLITPUSH_DB_PASSWORD`, `TRAVELBIN_DB_PASSWORD`, `ITINERARY_DB_PASSWORD` | Per-app DB passwords consumed by `init.sh` (fresh installs) and the app compose files. ⚠️ On an existing volume these only take effect via SQL rotation (see Phase 0b). |
+| `Splitpush/.env` | `KEYCLOAK_CLIENT_SECRET` | Value comes from Keycloak Admin → `travel-platform` realm → Clients → `splitpush` → Credentials. The confidential client no longer falls back to the committed `splitpush-secret`. |
+| `TravelBin/.env` | `DJANGO_SECRET_KEY` | Replaces the old insecure `django-insecure-…` fallback. (`settings.py` still has its own fallback, but the compose `:?` guarantees the var is always set in docker prod.) |
+| `Itinerary-Agent/itinerary-agent-backend/.env` | `OPENAI_API_KEY`, `DATABASE_URL`, `TRAVELBIN_API_URL` | Loaded via `env_file:` in compose. `DATABASE_URL`/`KEYCLOAK_ISSUER` are overridden to prod values by the base compose `environment:` block. |
 
-- Credentials defined in `init.sql` — change defaults before first run
+Each app's `.env.example` documents its keys. `.env` files are matched by `**/.env` in `.gitignore` and are never committed.
 
-### Splitpush
+### Build-time vars (baked into frontend images, already set in base compose)
 
-```env
-POSTGRES_HOST=platform-postgres
-SPRING_PROFILES_ACTIVE=docker
-JAVA_TOOL_OPTIONS=-Xms128m -Xmx256m
-KEYCLOAK_CLIENT_SECRET=<from-keycloak-admin>
-```
+| Var | Value | Where |
+|---|---|---|
+| `VITE_API_URL` (TravelBin) | `https://travelbin-api.quangntran.com` | `TravelBin/docker-compose.yml` build args |
+| `VITE_API_URL` (Itinerary) | `https://agent-api.quangntran.com` | `Itinerary-Agent/docker-compose.yml` build args |
+| `VITE_KEYCLOAK_URL` | `https://auth.quangntran.com` | both frontends' build args |
 
-- In production, delete `KeycloakClientConfig.java` and restore standard `issuer-uri` autodiscovery in `application.properties`
-
-### TravelBin backend
-
-```env
-SECRET_KEY=<strong-django-secret>
-DB_HOST=platform-postgres
-KEYCLOAK_ISSUER=https://auth.quangntran.com/realms/travel-platform
-# KEYCLOAK_JWKS_URL not needed in production — issuer URL is publicly reachable
-```
-
-### TravelBin frontend
-
-```env
-VITE_API_URL=https://api.quangntran.com
-```
-
-### Itinerary-Agent backend
-
-```env
-OPENAI_API_KEY=<your-key>
-DATABASE_URL=postgresql://itinerary_user:<pass>@platform-postgres:5432/itinerary_agent
-KEYCLOAK_ISSUER=https://auth.quangntran.com/realms/travel-platform
-KEYCLOAK_JWKS_URL=https://auth.quangntran.com/realms/travel-platform/protocol/openid-connect/certs
-TRAVELBIN_API_URL=https://api.quangntran.com
-```
+> These are committed in the base compose files (not secrets). The local-dev
+> overrides supply `http://localhost:*` values. Rebuild the frontend image after
+> changing them — they are compiled in, not read at runtime.
 
 ### Keycloak client redirect URIs to update
 
@@ -274,7 +257,21 @@ sudo systemctl start fail2ban
 Default config bans IPs after 5 failed SSH attempts. No further config needed for basic protection.
 
 ### OCI Security List reminder
-Only ports 22, 80, 443 should be open. All app ports (8080, 8000, 3001, etc.) are internal only — nginx proxies them and they are never exposed directly.
+Only ports 22, 80, 443 should be open. All app ports are internal — nginx proxies them.
+
+**Defense in depth (compose-level binding).** The sensitive service ports are now bound to `127.0.0.1` in the base compose files, so they are unreachable from other hosts even if the OCI Security List is misconfigured:
+
+| Port | Service | Binding |
+|---|---|---|
+| 8180 | Keycloak admin/SSO | `127.0.0.1:8180:8080` |
+| 8080 | Splitpush | `127.0.0.1:8080:8080` |
+| 8000 | TravelBin API | `127.0.0.1:8000:8000` |
+| 5000 | Itinerary-Agent backend | `127.0.0.1:5000:5000` |
+| 5432 | platform-postgres | not published in prod (override binds `127.0.0.1` for local tools) |
+| 3001 | TravelBin frontend | `3001:3001` (**0.0.0.0** — left open for local LAN device testing) |
+| 3010 | Itinerary-Agent frontend | `3010:3000` (**0.0.0.0** — same) |
+
+nginx reaches every service via `localhost:<port>`, so localhost binding does not affect the reverse proxy; inter-container calls use service names on `travelplatform-network`, never the published ports.
 
 ### Shared Postgres — remove host exposure + rotate credentials (Phase 0, do first)
 
@@ -352,11 +349,14 @@ docker compose -f docker-compose.yml up -d <service-name>
 - [x] SSH access confirmed (required IPv6 + internet gateway — see log below)
 - [x] Docker installed on server
 - [x] Repos cloned on server (one repo per app + `travel-platform-infra`)
-- [x] All `.env` files filled with production values
+- [ ] All required `.env` files present on the server (see "Environment Variables to Set" — `keycloak-service`, `postgres-service`, `Splitpush`, `TravelBin`, `Itinerary-Agent` backend). Containers with `${VAR:?}` guards **fail to start** if missing.
 - [x] Keycloak admin password changed from default (production no longer uses `admin`/`admin`; CLAUDE.md still documents the dev default)
-- [ ] PostgreSQL credentials changed from defaults in `init.sql` (still default in prod — DO THIS)
-- [x] Django `SECRET_KEY` env-based (override `DJANGO_SECRET_KEY` for a strong value)
+- [x] `KEYCLOAK_CLIENT_SECRET` required via compose (`Splitpush/.env`) — no longer falls back to committed default
+- [ ] PostgreSQL credentials rotated from defaults (still default in prod — DO THIS via Phase 0b SQL rotation, not just `.env`)
+- [x] Django `SECRET_KEY` now **required** (`DJANGO_SECRET_KEY` in `TravelBin/.env`; insecure fallback removed from compose)
+- [x] Sensitive service ports (8180/8080/8000/5000) bound to `127.0.0.1` in compose
 - [x] `DEBUG=False` in TravelBin Django settings
+- [x] Splitpush OAuth/security logging lowered DEBUG→WARN in `application-docker.properties`
 - [x] OpenAI API key set for Itinerary-Agent
 
 ### DNS + TLS
